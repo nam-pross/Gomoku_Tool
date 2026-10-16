@@ -3,7 +3,7 @@
 
 Mở game bằng trình duyệt, rồi kéo một khung chứa cả bàn cờ.
 Thừa viền trắng cũng được. Tool tìm các đường kẻ, đọc quân đen và quân trắng,
-rồi khoanh nước nên đi. Phím T bật hoặc tắt tự click.
+rồi khoanh nước nên đi. Phím F2 bật hoặc tắt tự click.
 
     python app.py
     python app.py --side black
@@ -30,8 +30,9 @@ WHITE = 2
 # Search only looks at empty points within two steps of a stone. A five, or
 # the single square that stops the other side's five, is played at once. An
 # open four is played when the other side has none of the 5-cell threats.
-# Anything else is negamax with alpha-beta, ordered by the pattern score of
-# the lines through each point.
+# Anything else is negamax with alpha-beta. A move is ordered by the shape it
+# would make, not by the whole line it sits on, and a five is taken or blocked
+# before any other idea.
 
 _INF = 10**15
 
@@ -102,14 +103,20 @@ def winner(board: list[int], size: int) -> int:
 
 
 def choose_move(
-    board: list[int], size: int, player: int, depth: int = 6, time_limit: float | None = 1.0
+    board: list[int],
+    size: int,
+    player: int,
+    depth: int = 6,
+    time_limit: float | None = 1.0,
+    complete: bool = False,
 ) -> tuple[int, int] | None:
     """Return the column and row to play, or None when the game is over or full.
 
     The first look is a five of our own, then the one square that blocks a five
     of theirs. An open four comes next, when they have no 5-cell pattern.
     The rest is alpha-beta, deeper and deeper until depth or time_limit.
-    The first level always finishes, so there is always an answer.
+    complete runs every depth and does not stop early, so the move is the
+    deepest result. The first level always finishes, so there is always an answer.
     """
     if len(board) != size * size:
         raise ValueError("board length does not match size")
@@ -145,7 +152,7 @@ def choose_move(
                     return x, y
 
     pos = _Board(board, size)
-    deadline = time.perf_counter() + time_limit if time_limit else None
+    deadline = None if complete or not time_limit else time.perf_counter() + time_limit
     depth = max(1, min(12, depth))
     best = None
     prev = None
@@ -157,9 +164,9 @@ def choose_move(
         if move is None:
             break
         best = move
-        # A finished five is already decisive. Once two deeper passes agree,
-        # more depth only spends the time the next scan is waiting on.
-        if abs(score) >= 500_000 or (move == prev and level >= 3):
+        # A finished five is already decisive. A partial search may stop once
+        # two deeper passes agree. A complete search keeps going to depth.
+        if abs(score) >= 500_000 or (not complete and move == prev and level >= 3):
             break
         prev = move
         if deadline is not None and time.perf_counter() > deadline:
@@ -175,7 +182,12 @@ def choose_move(
         else:
             center = size // 2
             best = min(points, key=lambda index: abs(index % size - center) + abs(index // size - center))
-    return best % size, best // size
+    x, y = best % size, best // size
+    if board[y * size + x] != EMPTY:
+        return None
+    if any(board) and not _has_neighbor(board, size, x, y):
+        return None
+    return x, y
 
 
 def _inside(size: int, x: int, y: int) -> bool:
@@ -284,6 +296,59 @@ def _makes_open_four(board: list[int], size: int, x: int, y: int, player: int) -
     return False
 
 
+def _move_value(board: list[int], size: int, index: int, player: int) -> int:
+    """How useful it is to play this empty cell, for us and as a block.
+
+    Only the cells next to the point count. A strong line elsewhere on the
+    same row does not make a far empty cell look like a good move.
+    """
+    x = index % size
+    y = index // size
+    other = opponent(player)
+    if _makes_five(board, size, x, y, player):
+        return 2_000_000
+    if _makes_five(board, size, x, y, other):
+        return 1_500_000
+    total = 0
+    for dx, dy in _AXES:
+        mine = []
+        theirs = []
+        for step in range(-5, 6):
+            if step == 0:
+                mine.append("1")
+                theirs.append("1")
+                continue
+            nx = x + dx * step
+            ny = y + dy * step
+            if not _inside(size, nx, ny):
+                mine.append("2")
+                theirs.append("2")
+                continue
+            value = board[ny * size + nx]
+            if value == EMPTY:
+                mine.append("0")
+                theirs.append("0")
+            elif value == player:
+                mine.append("1")
+                theirs.append("2")
+            else:
+                mine.append("2")
+                theirs.append("1")
+        total += _window_score("".join(mine)) + _window_score("".join(theirs))
+    return total
+
+
+def _fives_at(board: list[int], size: int, near: list[int], player: int) -> list[int]:
+    """Empty cells in near where player would complete five."""
+    found = []
+    for index in near:
+        if board[index]:
+            continue
+        if _makes_five(board, size, index % size, index // size, player):
+            found.append(index)
+    return found
+
+
 def _has_neighbor(board: list[int], size: int, x: int, y: int) -> bool:
     """A stone lies one or two steps away along a row, column or diagonal."""
     _lines, _through, neigh = _geometry(size)
@@ -374,23 +439,14 @@ class _Board:
             self.near[other] -= 1
 
     def candidates(self, player: int) -> list[int]:
-        """Empty cells within two steps of a stone, strongest lines first.
-
-        Both colors count, so a square that blocks the other side ranks with
-        a square that builds our own line.
-        """
-        ours = self.black if player == BLACK else self.white
-        theirs = self.white if player == BLACK else self.black
+        """Empty cells within two steps of a stone, best move first."""
         found = [
             index
             for index, value in enumerate(self.board)
             if not value and self.near[index]
         ]
         found.sort(
-            key=lambda index: (
-                sum(ours[number] + theirs[number] for number in self.through[index]),
-                self._closeness(index),
-            ),
+            key=lambda index: (_move_value(self.board, self.size, index, player), self._closeness(index)),
             reverse=True,
         )
         return found
@@ -423,9 +479,25 @@ def _search(
 ) -> tuple[int, int | None]:
     if deadline is not None and time.perf_counter() > deadline:
         raise _Timeout
+    finished = winner(pos.board, pos.size)
+    if finished:
+        return (10**12 if finished == player else -(10**12)), None
+    other = opponent(player)
+    near = [index for index, value in enumerate(pos.board) if not value and pos.near[index]]
+    wins = _fives_at(pos.board, pos.size, near, player)
+    if wins:
+        return 10**12, wins[0]
+    blocks = _fives_at(pos.board, pos.size, near, other)
+    if len(blocks) >= 2:
+        return -(10**12), blocks[0]
     if depth <= 0:
+        if blocks:
+            return -(10**12), blocks[0]
         return pos.value(player), None
-    moves = pos.candidates(player)
+    if blocks:
+        moves = blocks
+    else:
+        moves = pos.candidates(player)
     if not moves:
         return 0, None
     # The lines above already put blocks and builds first. Keeping the rest
@@ -433,7 +505,6 @@ def _search(
     cap = 18 if depth <= 1 else (14 if depth == 2 else 10)
     if len(moves) > cap:
         moves = moves[:cap]
-    other = opponent(player)
     best = -_INF
     best_move = moves[0]
     for index in moves:
@@ -622,24 +693,21 @@ def _grids_close(a, b, tol: int = 6) -> bool:
     return len(a) == len(b) and all(abs(p - q) <= tol for p, q in zip(a, b))
 
 
-def parse_board(image, xs=None, ys=None):
-    """Return line columns, line rows, and one value per intersection.
+def find_grid(image):
+    """Return the line columns and rows, or None when no regular grid is visible.
 
-    xs and ys, when given, are reused instead of searching for the grid again.
     The five star dots fix the grid when they are visible. Line search is the fallback.
-    Returns None when no regular grid is visible.
     """
     if image.mode != "RGB":
         image = image.convert("RGB")
     pixels = image.load()
     width, height = image.size
-    if xs is None or ys is None:
-        found = _grid_from_stars(pixels, width, height)
-        if found is None:
-            xs = _lines(pixels, width, height, vertical=True)
-            ys = _lines(pixels, width, height, vertical=False)
-        else:
-            xs, ys = found
+    found = _grid_from_stars(pixels, width, height)
+    if found is None:
+        xs = _lines(pixels, width, height, vertical=True)
+        ys = _lines(pixels, width, height, vertical=False)
+    else:
+        xs, ys = found
     if not xs or not ys or len(xs) != len(ys):
         return None
     size = len(xs)
@@ -648,10 +716,31 @@ def parse_board(image, xs=None, ys=None):
     step = (xs[-1] - xs[0]) / (size - 1)
     if step < 8:
         return None
-    board = []
-    for y in ys:
-        for x in xs:
-            board.append(_stone(pixels, width, height, x, y, step))
+    return list(xs), list(ys)
+
+
+def parse_board(image, xs=None, ys=None):
+    """Return line columns, line rows, and one value per intersection.
+
+    xs and ys, when given, are reused instead of searching for the grid again.
+    Returns None when no regular grid is visible.
+    """
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    pixels = image.load()
+    width, height = image.size
+    if xs is None or ys is None:
+        grid = find_grid(image)
+        if grid is None:
+            return None
+        xs, ys = grid
+    if not xs or not ys or len(xs) != len(ys):
+        return None
+    size = len(xs)
+    step = (xs[-1] - xs[0]) / (size - 1)
+    if step < 8:
+        return None
+    board = [_stone(pixels, width, height, x, y, step) for y in ys for x in xs]
     return list(xs), list(ys), board
 
 
@@ -865,17 +954,17 @@ def _is_ink(red: int, green: int, blue: int) -> bool:
     return bright < 130 and green < red + 30
 
 
-def _rgb_disk(pixels, width: int, height: int, x: int, y: int, radius: int) -> list[tuple[int, int, int]]:
+# Twelve points inside the stone, off the grid cross, then four on the rim.
+_BODY = ((1, 1), (1, -1), (-1, 1), (-1, -1), (2, 1), (2, -1), (-2, 1), (-2, -1), (1, 2), (1, -2), (-1, 2), (-1, -2))
+_RIM = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+def _probe(pixels, width: int, height: int, x: int, y: int, radius: int) -> list[tuple[int, int, int]]:
     colors = []
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if dx * dx + dy * dy > radius * radius:
-                continue
-            if abs(dx) <= 1 or abs(dy) <= 1:
-                continue
-            pixel = _at(pixels, width, height, x + dx, y + dy)
-            if pixel is not None:
-                colors.append(pixel[:3])
+    for dx, dy in _BODY:
+        pixel = _at(pixels, width, height, x + (dx * radius) // 2, y + (dy * radius) // 2)
+        if pixel is not None:
+            colors.append(pixel[:3])
     return colors
 
 
@@ -883,38 +972,48 @@ def _stone(pixels, width: int, height: int, x: int, y: int, step: float) -> int:
     background = _background(pixels, width, height, x, y, step)
     if background is None:
         return EMPTY
-    radius = max(4, int(step * 0.26))
-    colors = _rgb_disk(pixels, width, height, x, y, radius)
+    radius = max(4, int(step * 0.28))
+    colors = _probe(pixels, width, height, x, y, radius)
     if len(colors) < 8:
         return EMPTY
-    teal = sum(1 for red, green, blue in colors if _is_teal(red, green, blue)) / len(colors)
-    ink = sum(1 for red, green, blue in colors if _is_ink(red, green, blue)) / len(colors)
+    teal = sum(1 for red, green, blue in colors if _is_teal(red, green, blue))
+    ink = sum(1 for red, green, blue in colors if _is_ink(red, green, blue))
+    count = len(colors)
     # Teal is the O on this board. It is darker than the page, so brightness
     # alone would call it black and glue both colors into one line of five.
-    if teal > 0.35 and teal >= ink:
+    if teal >= 4 and teal >= ink:
         return WHITE
-    if ink > 0.45 and ink > teal:
+    if ink >= 5 and ink > teal:
         return BLACK
-    disk = _disk(pixels, width, height, x, y, radius, skip_cross=True)
-    if len(disk) < 8:
-        return EMPTY
-    disk.sort()
-    median = disk[len(disk) // 2]
-    dark = sum(value < background - 35 for value in disk) / len(disk)
-    if dark > 0.45 and median < background - 28 and ink >= teal:
+    bright = sorted(_brightness(color) for color in colors)
+    median = bright[count // 2]
+    dark = sum(value < background - 35 for value in bright)
+    if dark * 2 > count and median < background - 28 and ink >= teal:
         return BLACK
     # White stones on a pale page are only a little brighter than the wood.
-    lifted = sum(value >= background + 5 for value in disk) / len(disk)
-    if lifted > 0.5 and median >= background + 5 and dark < 0.25:
+    lifted = sum(value >= background + 5 for value in bright)
+    if lifted * 2 >= count and median >= background + 5 and dark * 4 < count:
         return WHITE
     # Same color as the page, but the stone still has a gray rim.
-    if (
-        _has_stone_ring(pixels, width, height, x, y, step, background)
-        and median >= background - 12
-        and dark < 0.35
-    ):
+    if _rim_dark(pixels, width, height, x, y, step, background) and median >= background - 12 and dark * 3 < count:
         return WHITE
     return EMPTY
+
+
+def _rim_dark(pixels, width, height, x, y, step, background) -> bool:
+    """True when the four diagonal points on the stone edge are darker than the page."""
+    radius = max(5, int(step * 0.42))
+    shift = int(round(radius * 0.72))
+    darker = 0
+    seen = 0
+    for dx, dy in _RIM:
+        pixel = _at(pixels, width, height, x + dx * shift, y + dy * shift)
+        if pixel is None:
+            continue
+        seen += 1
+        if _brightness(pixel) < background - 22:
+            darker += 1
+    return seen >= 3 and darker >= 3
 
 
 def _background(pixels, width, height, x, y, step):
@@ -928,41 +1027,6 @@ def _background(pixels, width, height, x, y, step):
         return None
     samples.sort()
     return samples[len(samples) // 2]
-
-
-def _disk(pixels, width, height, x, y, radius, skip_cross: bool) -> list[int]:
-    values = []
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if dx * dx + dy * dy > radius * radius:
-                continue
-            if skip_cross and (abs(dx) <= 1 or abs(dy) <= 1):
-                continue
-            pixel = _at(pixels, width, height, x + dx, y + dy)
-            if pixel is not None:
-                values.append(_brightness(pixel))
-    return values
-
-
-def _has_stone_ring(pixels, width, height, x, y, step, background) -> bool:
-    """True when a ring at the usual stone edge is darker than the page."""
-    inner = max(3, int(step * 0.30))
-    outer = max(inner + 2, int(step * 0.48))
-    values = []
-    for dy in range(-outer, outer + 1):
-        for dx in range(-outer, outer + 1):
-            dist = dx * dx + dy * dy
-            if dist < inner * inner or dist > outer * outer:
-                continue
-            if abs(dx) <= 1 or abs(dy) <= 1:
-                continue
-            pixel = _at(pixels, width, height, x + dx, y + dy)
-            if pixel is not None:
-                values.append(_brightness(pixel))
-    if len(values) < 8:
-        return False
-    darker = sum(value < background - 22 for value in values) / len(values)
-    return darker > 0.16
 
 
 def _at(pixels, width, height, x, y):
@@ -1154,6 +1218,10 @@ class Watcher:
         self.prev_raw: tuple | None = None
         self.grid_at = 0.0
         self.alt: tuple | None = None
+        self._grid_busy = False
+        self._grid_found = None
+        self._grid_gen = 0
+        self.matched_at: float | None = None
         self.changed_at = time.perf_counter()
         self.acted_at = 0.0
         self.acted_board: tuple | None = None
@@ -1165,7 +1233,7 @@ class Watcher:
         self._result_move = None
         self.running = True
         self.auto = False
-        self.t_down = False
+        self.f2_down = False
         self.last_marks = None
         x, y, width, height = region
 
@@ -1182,7 +1250,7 @@ class Watcher:
         self.overlay.update_idletasks()
         make_clickthrough(self.overlay)
         self.quiet = hide_from_capture(self.overlay) and capture_ignores(self.overlay, self.canvas, region)
-        self.interval = 160 if self.quiet else 280
+        self.interval = 40 if self.quiet else 70
 
         if pyautogui is not None:
             pyautogui.FAILSAFE = True
@@ -1220,7 +1288,7 @@ class Watcher:
         buttons = tk.Frame(self.panel)
         buttons.pack(side="bottom", pady=(0, 4))
         tk.Button(buttons, text="Đọc lại lưới", command=self.reset_grid).pack(side="left", padx=4)
-        self.auto_button = tk.Button(buttons, command=self.toggle_auto, width=18)
+        self.auto_button = tk.Button(buttons, command=self.toggle_auto, width=20)
         self.auto_button.pack(side="left", padx=4)
         tk.Button(buttons, text="Dừng", command=self.stop).pack(side="left", padx=4)
 
@@ -1253,11 +1321,11 @@ class Watcher:
 
     def _show_auto_state(self):
         if self.auto:
-            self.auto_text.set("TỰ ĐỘNG: BẬT  (bấm T để tắt)")
-            self.auto_button.configure(text="Tắt tự động (T)")
+            self.auto_text.set("TỰ ĐỘNG: BẬT  (bấm F2 để tắt)")
+            self.auto_button.configure(text="Tắt tự động (F2)")
         else:
-            self.auto_text.set("TỰ ĐỘNG: TẮT  (bấm T để bật)")
-            self.auto_button.configure(text="Bật tự động (T)")
+            self.auto_text.set("TỰ ĐỘNG: TẮT  (bấm F2 để bật)")
+            self.auto_button.configure(text="Bật tự động (F2)")
 
     def _invalidate(self):
         with self._lock:
@@ -1271,15 +1339,15 @@ class Watcher:
         if not self.running:
             return
         state = ctypes.windll.user32.GetAsyncKeyState
-        down = bool(state(0x54) & 0x8000)
+        down = bool(state(0x71) & 0x8000)
         modifier = any(state(key) & 0x8000 for key in (0x11, 0x12, 0x5B, 0x5C))
-        if down and not self.t_down and not modifier:
+        if down and not self.f2_down and not modifier:
             self.toggle_auto()
-        self.t_down = down
+        self.f2_down = down
         self.panel.after(40, self.poll_keys)
 
-    def _t_pressed(self) -> bool:
-        return bool(ctypes.windll.user32.GetAsyncKeyState(0x54) & 0x8000)
+    def _f2_pressed(self) -> bool:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x71) & 0x8000)
 
     def reset_grid(self):
         self.xs = None
@@ -1289,6 +1357,10 @@ class Watcher:
         self.prev_raw = None
         self.grid_at = 0.0
         self.alt = None
+        with self._lock:
+            self._grid_gen += 1
+            self._grid_found = None
+        self.matched_at = None
         self.acted_board = None
         self.retries = 0
         self.last_marks = None
@@ -1333,44 +1405,109 @@ class Watcher:
         self.overlay.lift()
         self.overlay.update_idletasks()
 
-    def _sample(self, image):
-        """Read stones on the locked grid. Re-find the lines about once a second.
+    def _grid_worker(self, image, gen: int) -> None:
+        try:
+            found = find_grid(image)
+        except Exception:
+            found = None
+        with self._lock:
+            if gen == self._grid_gen:
+                self._grid_found = found
+            self._grid_busy = False
 
-        A fresh find that is only a pixel off the lock is ignored, so the click
-        point and the stone colors do not jitter. A genuinely different grid
-        has to show up twice before it replaces the lock.
-        """
-        now = time.perf_counter()
-        if self.xs is not None and now - self.grid_at < 1.0:
-            return parse_board(image, self.xs, self.ys)
-        fresh = parse_board(image)
-        self.grid_at = now
-        if fresh is None:
-            if self.xs is None:
-                return None
-            return parse_board(image, self.xs, self.ys)
-        nxs, nys, _board = fresh
+    def _take_grid(self) -> None:
+        with self._lock:
+            found = self._grid_found
+            self._grid_found = None
+        if not found:
+            return
+        nxs, nys = found
         if self.xs is None:
             self.xs, self.ys = list(nxs), list(nys)
-            return fresh
+            self.stable = None
+            self.prev_raw = None
+            return
         if _grids_close(nxs, self.xs) and _grids_close(nys, self.ys):
             self.alt = None
-            return parse_board(image, self.xs, self.ys)
+            return
         if self.alt is not None and _grids_close(nxs, self.alt[0]) and _grids_close(nys, self.alt[1]):
             self.xs, self.ys = list(nxs), list(nys)
             self.alt = None
             self.stable = None
             self.prev_raw = None
             self.pending = None
-            return fresh
+            return
         self.alt = (list(nxs), list(nys))
+
+    def _sample(self, image):
+        """Read stones on the locked grid.
+
+        Searching for the lines again runs beside the stone read, so a slow
+        grid pass cannot hold up the next stone.
+        """
+        self._take_grid()
+        now = time.perf_counter()
+        if self.xs is None:
+            grid = find_grid(image)
+            if grid is None:
+                return None
+            self.xs, self.ys = grid
+            self.grid_at = now
+            return parse_board(image, self.xs, self.ys)
+        start_grid = False
+        gen = 0
+        if now - self.grid_at >= 4.0:
+            with self._lock:
+                if not self._grid_busy and now - self.grid_at >= 4.0:
+                    self._grid_busy = True
+                    gen = self._grid_gen
+                    start_grid = True
+        if start_grid:
+            self.grid_at = now
+            threading.Thread(target=self._grid_worker, args=(image.copy(), gen), daemon=True).start()
         return parse_board(image, self.xs, self.ys)
+
+    def _absorb(self, raw: tuple) -> bool:
+        """Fold raw into the board one cell at a time.
+
+        A cell changes only after it reads the same value twice in a row.
+        The scan is finished only when every cell matches and stays that way,
+        so a move is not chosen while stones are still arriving.
+        """
+        now = time.perf_counter()
+        if self.stable is None:
+            self.stable = raw
+            self.prev_raw = raw
+            self.changed_at = now
+            self.matched_at = None
+            return False
+        prev = self.prev_raw
+        stable = list(self.stable)
+        changed = False
+        for index, value in enumerate(raw):
+            if value == stable[index]:
+                continue
+            if prev is not None and prev[index] == value:
+                stable[index] = value
+                changed = True
+        self.prev_raw = raw
+        if changed:
+            self.stable = tuple(stable)
+            self.changed_at = now
+            self.matched_at = None
+        if raw != self.stable:
+            self.matched_at = None
+            return False
+        if self.matched_at is None:
+            self.matched_at = now
+            return False
+        return now - self.matched_at >= 0.35
 
     def _read_and_mark(self):
         if not self.quiet:
             self.overlay.withdraw()
             self.panel.update()
-            time.sleep(0.03)
+            time.sleep(0.02)
         x, y, width, height = self.region
         image = grab((x, y, x + width, y + height))
         parsed = self._sample(image)
@@ -1380,16 +1517,9 @@ class Watcher:
             return
         xs, ys, board = parsed
         size = len(xs)
-        self.interval = 80 if self.quiet else 140
-        raw = tuple(board)
-        agreed = self.prev_raw is not None and raw == self.prev_raw
-        now = time.perf_counter()
-        if agreed and raw != self.stable:
-            self.stable = raw
-            self.changed_at = now
-        self.prev_raw = raw
-        settled = self.stable is not None and raw == self.stable
-        shown = list(self.stable if self.stable is not None else raw)
+        self.interval = 20 if self.quiet else 40
+        settled = self._absorb(tuple(board))
+        shown = list(self.stable if self.stable is not None else board)
 
         move, advice = self._advise(shown, size, settled)
         picture = render(shown, size, move)
@@ -1409,9 +1539,9 @@ class Watcher:
             self.board.insert("end", picture)
         self._auto_play(move, advice, settled, shown, xs, ys, scale_x, scale_y)
 
-    def _think(self, board: list[int], size: int, player: int, depth: int, budget: float, key, gen: int) -> None:
+    def _think(self, board: list[int], size: int, player: int, depth: int, budget: float | None, key, gen: int) -> None:
         try:
-            move = choose_move(board, size, player, depth, budget)
+            move = choose_move(board, size, player, depth, budget, complete=True)
         except Exception:
             move = None
         with self._lock:
@@ -1427,6 +1557,10 @@ class Watcher:
             return None, "Đen đã có năm quân."
         if done == WHITE:
             return None, "Trắng đã có năm quân."
+        if not settled:
+            black = sum(value == BLACK for value in board)
+            white = sum(value == WHITE for value in board)
+            return None, f"Đen {black}, trắng {white}. Đang quét hết bàn…"
         turn = side_to_move(board)
         choice = self.side_var.get()
         black = sum(value == BLACK for value in board)
@@ -1443,17 +1577,19 @@ class Watcher:
                 return None, f"{counts} Đến lượt {name}."
             if not any(board) and player == WHITE:
                 return None, "Bàn trống. Đen đi trước."
+        # Run the search all the way through. Depth 4 is the deepest pass that
+        # still finishes; "Nghĩ kỹ hơn" adds one more pass.
         if self.deep.get():
-            depth, budget = self.depth + 2, 0.7
+            depth, budget = min(self.depth + 1, 5), None
         else:
-            depth, budget = self.depth, 0.25
+            depth, budget = min(self.depth, 4), None
         key = (tuple(board), player, depth, budget)
         with self._lock:
             if self._result_key == key:
                 move = self._result_move
             else:
                 move = None
-                if settled and self._worker_key is None:
+                if self._worker_key is None:
                     self._worker_key = key
                     threading.Thread(
                         target=self._think,
@@ -1461,9 +1597,7 @@ class Watcher:
                         daemon=True,
                     ).start()
         if move is None:
-            if not settled:
-                return None, f"{counts} Đang đọc bàn…"
-            return None, f"{counts} Đang tính nước…"
+            return None, f"{counts} Đang tính nước tốt nhất…"
         name = "Đen" if player == BLACK else "Trắng"
         return move, f"{counts} Lượt {name}. Gợi ý hàng {move[1] + 1}, cột {move[0] + 1}."
 
@@ -1515,19 +1649,20 @@ class Watcher:
     def _click(self, move, xs, ys, scale_x, scale_y):
         sx, sy = self._point(move, xs, ys, scale_x, scale_y)
         pyautogui.moveTo(sx, sy)
-        time.sleep(0.02)
+        time.sleep(0.03)
         pyautogui.mouseDown(sx, sy, button="left")
-        time.sleep(0.02)
+        time.sleep(0.04)
         pyautogui.mouseUp(sx, sy, button="left")
 
     def _auto_play(self, move, advice, settled, shown, xs, ys, scale_x, scale_y):
+        # settled means every intersection has agreed for a stretch. move is
+        # None until the finished search for that exact board comes back.
         if not self.auto or not self.running or pyautogui is None or not settled or move is None:
             return
         if advice.startswith("Đen đã") or advice.startswith("Trắng đã"):
             return
         now = time.perf_counter()
-        # The new stone has to sit still briefly, so a placing animation is not read as the stone.
-        if now - self.changed_at < 0.10:
+        if now - self.changed_at < 0.35:
             return
         snapshot = tuple(shown)
         if snapshot == self.acted_board:
@@ -1543,7 +1678,17 @@ class Watcher:
             if now - self.acted_at < 0.16:
                 return
             self.retries = 0
-        if self._t_pressed():
+        if self._f2_pressed():
+            return
+        col, row = move
+        if not (0 <= col < len(xs) and 0 <= row < len(ys)):
+            return
+        if shown[row * len(xs) + col] != EMPTY:
+            return
+        origin_x, origin_y, width, height = self.region
+        sx = round(origin_x + xs[col] * scale_x)
+        sy = round(origin_y + ys[row] * scale_y)
+        if not (origin_x <= sx < origin_x + width and origin_y <= sy < origin_y + height):
             return
         self.acted_board = snapshot
         try:
@@ -1564,7 +1709,7 @@ def main():
     parser.add_argument("--depth", type=int, default=6, help="Độ sâu tìm nước tối đa, từ 1 đến 8")
     args = parser.parse_args()
     print("Mở bàn cờ caro, rồi kéo một khung chứa cả bàn. Thừa viền cũng được.")
-    print("Tool đọc quân và khoanh một nước. Phím T bật hoặc tắt tự click.")
+    print("Tool đọc quân và khoanh một nước. Phím F2 bật hoặc tắt tự click.")
     print("Dừng khẩn: đưa chuột vào góc trên bên trái màn hình chính.")
     region = select_region()
     if region is None:
