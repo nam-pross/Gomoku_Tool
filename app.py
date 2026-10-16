@@ -6,8 +6,11 @@ Thừa viền trắng cũng được. Tool tìm các đường kẻ, đọc quâ
 rồi khoanh nước nên đi. Phím F2 bật hoặc tắt tự click.
 
     python app.py
-    python app.py --side black
-    python app.py --side white
+    python app.py --side first
+    python app.py --side second
+
+Trước là người đi nước đầu, Sau là người kia. Màu của hai bên
+lấy từ số quân trên bàn, không gắn cứng X với Trước.
 """
 
 from __future__ import annotations
@@ -25,37 +28,13 @@ EMPTY = 0
 BLACK = 1
 WHITE = 2
 
-# Move choice follows gomokuAI. Every row, column and diagonal is scored by
-# the 5-cell and 6-cell windows below (the same shapes for both colors).
-# Search only looks at empty points within two steps of a stone. A five, or
-# the single square that stops the other side's five, is played at once. An
-# open four is played when the other side has none of the 5-cell threats.
-# Anything else is negamax with alpha-beta. A move is ordered by the shape it
-# would make, not by the whole line it sits on, and a five is taken or blocked
-# before any other idea.
+# Threats are five, open four, closed four, open three, and a fork: two
+# threats whose block squares are different, so one reply cannot stop both.
+# The position score counts those shapes for both colors. Search is negamax.
+# Fives, forks and fours stay in the move list; only quiet moves are capped.
 
 _INF = 10**15
-
-_FIVE = {
-    "11111": 1_000_000,
-    "11110": 5_000,
-    "01111": 5_000,
-    "11011": 5_000,
-    "10111": 5_000,
-    "11101": 5_000,
-}
-_SIX = {
-    "011110": 50_000,
-    "011100": 5_000,
-    "001110": 5_000,
-    "011010": 500,
-    "010110": 500,
-    "001100": 100,
-    "001010": 100,
-    "010100": 100,
-    "001000": 10,
-    "000100": 10,
-}
+_MATE = 10**12
 
 _AXES = ((1, 0), (0, 1), (1, 1), (1, -1))
 _RAYS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1))
@@ -66,18 +45,40 @@ def opponent(player: int) -> int:
     return WHITE if player == BLACK else BLACK
 
 
-def side_to_move(board: list[int]) -> int | None:
-    """Black starts. After that the side with fewer stones moves.
+def whose_turn(board: list[int], remembered: int = BLACK) -> tuple[int | None, int, int, int]:
+    """Return the side to move, the opener, and the two stone counts.
 
-    A gap larger than one stone means the reading skipped or invented a stone.
+    One pass. The side with fewer stones moves, so a lead of one says who
+    opened. White can open: then white is ahead and it is black's turn.
+    Equal counts are the opener's turn again. The remembered opener is only
+    used while the counts are level. A wider gap is a bad reading: the turn
+    is unknown and the remembered opener is left as it was.
     """
-    black = sum(value == BLACK for value in board)
-    white = sum(value == WHITE for value in board)
-    if black == white:
-        return BLACK
-    if black == white + 1:
-        return WHITE
-    return None
+    black = 0
+    white = 0
+    for value in board:
+        if value == BLACK:
+            black += 1
+        elif value == WHITE:
+            white += 1
+    opener = remembered if remembered in (BLACK, WHITE) else BLACK
+    if black == 0 and white == 0:
+        return BLACK, BLACK, 0, 0
+    gap = black - white
+    if gap == 0:
+        return opener, opener, black, white
+    if gap == 1:
+        return WHITE, BLACK, black, white
+    if gap == -1:
+        return BLACK, WHITE, black, white
+    return None, opener, black, white
+
+
+def _seat(player: int, opener: int) -> str:
+    """'đi trước (đen)' or 'đi sau (trắng)'."""
+    role = "trước" if player == opener else "sau"
+    color = "đen" if player == BLACK else "trắng"
+    return f"đi {role} ({color})"
 
 
 def winner(board: list[int], size: int) -> int:
@@ -109,14 +110,14 @@ def choose_move(
     depth: int = 6,
     time_limit: float | None = 1.0,
     complete: bool = False,
+    live=None,
 ) -> tuple[int, int] | None:
     """Return the column and row to play, or None when the game is over or full.
 
-    The first look is a five of our own, then the one square that blocks a five
-    of theirs. An open four comes next, when they have no 5-cell pattern.
-    The rest is alpha-beta, deeper and deeper until depth or time_limit.
-    complete runs every depth and does not stop early, so the move is the
-    deepest result. The first level always finishes, so there is always an answer.
+    Take a five, else the square that blocks theirs. An open four or two
+    separate fours is taken next, because one block cannot answer it. Anything
+    else is alpha-beta. complete does not stop when two depths agree. The first
+    depth always finishes.
     """
     if len(board) != size * size:
         raise ValueError("board length does not match size")
@@ -128,49 +129,46 @@ def choose_move(
         mid = size // 2
         return mid, mid
 
-    other = opponent(player)
-    our_five = None
-    their_five = None
-    for y in range(size):
-        for x in range(size):
-            if board[y * size + x] != EMPTY:
-                continue
-            if our_five is None and _makes_five(board, size, x, y, player):
-                our_five = (x, y)
-            elif their_five is None and _makes_five(board, size, x, y, other):
-                their_five = (x, y)
-    if our_five is not None:
-        return our_five
-    if their_five is not None:
-        return their_five
-    if not _has_five_pattern(board, size, other):
-        for y in range(size):
-            for x in range(size):
-                if board[y * size + x] != EMPTY:
-                    continue
-                if _has_neighbor(board, size, x, y) and _makes_open_four(board, size, x, y, player):
-                    return x, y
+    # Only an immediate five, the one square that stops theirs, or a threat
+    # that still wins after their best reply. Scan order is not a reason.
+    forced = _best_immediate(board, size, player)
+    if forced is not None:
+        return forced
 
     pos = _Board(board, size)
-    deadline = None if complete or not time_limit else time.perf_counter() + time_limit
-    depth = max(1, min(12, depth))
+    ranked = pos._ranked(player)
+    if not ranked:
+        return None
+    # No threat yet. Searching these squares only walked the same line
+    # toward the corner, because equal scores kept the highest cell index.
+    if ranked[0][0] == 0:
+        index = ranked[0][2]
+        return index % size, index // size
+    deadline = None if not time_limit else time.perf_counter() + time_limit
+    depth = max(1, min(8, depth))
     best = None
     prev = None
     for level in range(1, depth + 1):
+        if live is not None and not live():
+            break
+        if deadline is not None and level > 1 and time.perf_counter() >= deadline:
+            break
         try:
-            score, move = _search(pos, player, level, -_INF, _INF, deadline if level > 1 else None)
+            # The first pass always finishes. Later passes stop at the deadline
+            # so a deeper request still returns the best finished depth.
+            score, move = _search(
+                pos, player, level, -_INF, _INF, None if level == 1 else deadline, live
+            )
         except _Timeout:
             break
         if move is None:
             break
         best = move
-        # A finished five is already decisive. A partial search may stop once
-        # two deeper passes agree. A complete search keeps going to depth.
-        if abs(score) >= 500_000 or (not complete and move == prev and level >= 3):
+        # A proven five is decisive for either color. A short search may also
+        # stop once two deeper passes agree. "Nghĩ kỹ hơn" keeps going.
+        if abs(score) >= _MATE or (not complete and move == prev and level >= 3):
             break
         prev = move
-        if deadline is not None and time.perf_counter() > deadline:
-            break
     if best is None:
         points = pos.candidates(player)
         if not points:
@@ -195,17 +193,58 @@ def _inside(size: int, x: int, y: int) -> bool:
 
 
 def _window_score(text: str) -> int:
-    """Score of one line written with 1 for the side being counted."""
-    length = len(text)
-    if length < 5:
-        return 0
-    if length == 5:
-        return _FIVE.get(text, 0)
+    """Threat score of one line. 1 is the side being counted, 2 is a wall.
+
+    Each shape is counted once. An open four is not also a pair of closed
+    fours, and a plain run of two stones stays cheap.
+    """
     score = 0
-    for start in range(length - 4):
-        score += _FIVE.get(text[start : start + 5], 0)
-    for start in range(length - 5):
-        score += _SIX.get(text[start : start + 6], 0)
+    start = 0
+    length = len(text)
+    while start < length:
+        if text[start] == "2":
+            start += 1
+            continue
+        end = start
+        while end < length and text[end] != "2":
+            end += 1
+        score += _segment_score(text[start:end])
+        start = end
+    return score
+
+
+def _segment_score(seg: str) -> int:
+    """Score one stretch with no opponent stones in it."""
+    if len(seg) < 5 or "1" not in seg:
+        return 0
+    used = [False] * len(seg)
+    score = 0
+
+    def take(pattern: str, points: int) -> None:
+        nonlocal score
+        at = 0
+        size = len(pattern)
+        while True:
+            found = seg.find(pattern, at)
+            if found < 0:
+                return
+            if any(used[found : found + size]):
+                at = found + 1
+                continue
+            for index in range(found, found + size):
+                used[index] = True
+            score += points
+            at = found + size
+
+    take("11111", 100_000_000)
+    take("011110", 1_000_000)
+    for pattern in ("11110", "01111", "11011", "11101", "10111"):
+        take(pattern, 50_000)
+    take("01110", 8_000)
+    take("011010", 2_000)
+    take("010110", 2_000)
+    take("001110", 700)
+    take("011100", 700)
     return score
 
 
@@ -278,64 +317,247 @@ def _makes_five(board: list[int], size: int, x: int, y: int, player: int) -> boo
     return False
 
 
-def _makes_open_four(board: list[int], size: int, x: int, y: int, player: int) -> bool:
-    """True when playing here makes empty-stone-stone-stone-stone-empty."""
+def _analyze_move(board: list[int], size: int, x: int, y: int, player: int):
+    """Shapes made by playing at this empty cell.
+
+    Returns fives, open fours, closed fours, open threes, half-open threes,
+    the squares that would then finish a five, and the ends of open threes.
+    """
+    fives = open4 = closed4 = open3 = half3 = 0
+    wins = []
+    ends = []
     for dx, dy in _AXES:
-        count = 1
-        ends = []
-        for sign in (1, -1):
-            nx = x + sign * dx
-            ny = y + sign * dy
-            while _inside(size, nx, ny) and board[ny * size + nx] == player:
-                count += 1
-                nx += sign * dx
-                ny += sign * dy
-            ends.append(_inside(size, nx, ny) and board[ny * size + nx] == EMPTY)
-        if count == 4 and ends[0] and ends[1]:
+        chars = []
+        coords = []
+        for step in range(-4, 5):
+            nx = x + dx * step
+            ny = y + dy * step
+            if step == 0:
+                chars.append("1")
+                coords.append(y * size + x)
+                continue
+            if not _inside(size, nx, ny):
+                chars.append("2")
+                coords.append(-1)
+                continue
+            value = board[ny * size + nx]
+            if value == EMPTY:
+                chars.append("0")
+            elif value == player:
+                chars.append("1")
+            else:
+                chars.append("2")
+            coords.append(ny * size + nx)
+        text = "".join(chars)
+        center = 4
+        dir_wins = []
+        five = False
+        for start in range(5):
+            window = text[start : start + 5]
+            if window == "11111":
+                five = True
+                break
+            if window.count("1") == 4 and window.count("0") == 1:
+                point = coords[start + window.index("0")]
+                if point >= 0 and point not in dir_wins:
+                    dir_wins.append(point)
+        left = center
+        while left > 0 and text[left - 1] == "1":
+            left -= 1
+        right = center
+        while right + 1 < 9 and text[right + 1] == "1":
+            right += 1
+        length = right - left + 1
+        left_open = left > 0 and text[left - 1] == "0"
+        right_open = right + 1 < 9 and text[right + 1] == "0"
+        if five or length >= 5:
+            fives += 1
+            continue
+        if length == 4 and left_open and right_open:
+            open4 += 1
+            for point in dir_wins:
+                if point not in wins:
+                    wins.append(point)
+            continue
+        if dir_wins:
+            closed4 += 1
+            for point in dir_wins:
+                if point not in wins:
+                    wins.append(point)
+            continue
+        if length == 3 and left_open and right_open:
+            open3 += 1
+            for slot in (left - 1, right + 1):
+                point = coords[slot]
+                if point >= 0 and point not in ends:
+                    ends.append(point)
+        elif length == 3 and (left_open or right_open):
+            half3 += 1
+    return fives, open4, closed4, open3, half3, wins, ends
+
+
+def _forcing(shape) -> bool:
+    """True when one reply cannot answer the threats this move creates."""
+    fives, open4, _closed4, open3, _half3, wins, _ends = shape
+    if fives or open4 or len(wins) >= 2:
+        return True
+    # A four plus a separate open three: blocking the four leaves the three.
+    return bool(wins) and open3 > 0 and any(point not in _ends for point in wins)
+
+
+def _nearby(board: list[int], size: int) -> list[int]:
+    """Empty cells within two steps of a stone."""
+    _lines, _through, neigh = _geometry(size)
+    seen = [False] * (size * size)
+    found = []
+    for index, value in enumerate(board):
+        if not value:
+            continue
+        for cell in neigh[index]:
+            if board[cell] or seen[cell]:
+                continue
+            seen[cell] = True
+            found.append(cell)
+    return found
+
+
+def _move_value(board: list[int], size: int, index: int, player: int) -> int:
+    """Classified value of one empty cell, for us and as a block.
+
+    The order is a starting point, not an absolute rule. Blocking their win
+    outranks our open four, because that four is useless if they win next.
+    A forcing double threat outranks a single open four. Broken threes and
+    quiet development stay below both.
+    """
+    return _classify(board, size, index, player)[1]
+
+
+def _classify(board: list[int], size: int, index: int, player: int) -> tuple[int, int]:
+    """Return a tier and a score. Higher tier is never trimmed away first."""
+    x = index % size
+    y = index // size
+    mine = _analyze_move(board, size, x, y, player)
+    theirs = _analyze_move(board, size, x, y, opponent(player))
+    mf, mo4, mc4, mo3, mh, mwins, _me = mine
+    tf, _to4, tc4, to3, th, twins, _te = theirs
+    if mf:
+        return 5, 5_000_000 + len(mwins) * 100 + mo4 * 10 + mo3
+    if tf:
+        return 4, 4_000_000 + len(twins) * 100 + mc4
+    if _forcing(mine):
+        return 3, 900_000 + len(mwins) * 1_000 + mo4 * 500 + mo3 * 20
+    if _forcing(theirs):
+        return 3, 860_000 + len(twins) * 1_000 + tc4 * 20
+    if mc4:
+        return 2, 90_000 + mc4 * 10 + mo3
+    if tc4:
+        return 2, 85_000 + tc4 * 10
+    if mo3 >= 2 or to3 >= 2:
+        return 2, 40_000 + mo3 * 100 + to3 * 50
+    if mo3:
+        return 1, 16_000
+    if to3:
+        return 1, 15_000
+    if mh or th:
+        return 1, 2_000 + mh * 10 + th * 5
+    return 0, 0
+
+
+def _win_squares(board: list[int], size: int, player: int) -> list[int]:
+    """Empty cells where player would complete five."""
+    found = []
+    for cell in _nearby(board, size):
+        if _analyze_move(board, size, cell % size, cell // size, player)[0]:
+            found.append(cell)
+    return found
+
+
+def _has_forcing_attack(board: list[int], size: int, player: int) -> bool:
+    """True when player can make an open four or two winning squares."""
+    for cell in _nearby(board, size):
+        shape = _analyze_move(board, size, cell % size, cell // size, player)
+        if shape[0] or shape[1] or len(shape[5]) >= 2:
             return True
     return False
 
 
-def _move_value(board: list[int], size: int, index: int, player: int) -> int:
-    """How useful it is to play this empty cell, for us and as a block.
+def _reply_holds(board: list[int], size: int, cell: int, player: int) -> bool:
+    """True when this move still wins after the opponent's best reply.
 
-    Only the cells next to the point count. A strong line elsewhere on the
-    same row does not make a far empty cell look like a good move.
+    A block that only delays a second threat does not count. Two winning
+    squares cannot both be answered. One winning square is answered, then
+    the board is checked again.
     """
-    x = index % size
-    y = index // size
+    board[cell] = player
+    try:
+        if winner(board, size) == player:
+            return True
+        other = opponent(player)
+        if _win_squares(board, size, other):
+            return False
+        ours = _win_squares(board, size, player)
+        if len(ours) >= 2:
+            return True
+        if len(ours) != 1:
+            return False
+        block = ours[0]
+        board[block] = other
+        try:
+            if _win_squares(board, size, player) or _has_forcing_attack(board, size, player):
+                return True
+        finally:
+            board[block] = EMPTY
+        return False
+    finally:
+        board[cell] = EMPTY
+
+
+def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int] | None:
+    """The winning move, the only saving block, or the richest forced threat.
+
+    Every open four is collected. Each one is kept only if it still wins
+    after the opponent replies. Among those, more winning squares and a
+    second threat beat a four that merely came first on the board.
+    """
+    fives = []
+    blocks = []
+    attacks = []
     other = opponent(player)
-    if _makes_five(board, size, x, y, player):
-        return 2_000_000
-    if _makes_five(board, size, x, y, other):
-        return 1_500_000
-    total = 0
-    for dx, dy in _AXES:
-        mine = []
-        theirs = []
-        for step in range(-5, 6):
-            if step == 0:
-                mine.append("1")
-                theirs.append("1")
-                continue
-            nx = x + dx * step
-            ny = y + dy * step
-            if not _inside(size, nx, ny):
-                mine.append("2")
-                theirs.append("2")
-                continue
-            value = board[ny * size + nx]
-            if value == EMPTY:
-                mine.append("0")
-                theirs.append("0")
-            elif value == player:
-                mine.append("1")
-                theirs.append("2")
-            else:
-                mine.append("2")
-                theirs.append("1")
-        total += _window_score("".join(mine)) + _window_score("".join(theirs))
-    return total
+    for cell in _nearby(board, size):
+        x, y = cell % size, cell // size
+        mine = _analyze_move(board, size, x, y, player)
+        if mine[0]:
+            fives.append((cell, mine))
+            continue
+        if _analyze_move(board, size, x, y, other)[0]:
+            blocks.append(cell)
+            continue
+        if mine[1] or len(mine[5]) >= 2 or _forcing(mine):
+            attacks.append((cell, mine))
+    if fives:
+        fives.sort(key=lambda item: (len(item[1][5]), item[1][1], item[1][3]), reverse=True)
+        cell = fives[0][0]
+        return cell % size, cell // size
+    if len(blocks) > 1:
+        return None
+    if len(blocks) == 1:
+        cell = blocks[0]
+        return cell % size, cell // size
+    best = None
+    best_key = None
+    for cell, shape in attacks:
+        if not _reply_holds(board, size, cell, player):
+            continue
+        x, y = cell % size, cell // size
+        center = size // 2
+        # More winning squares first. A corner square does not win a tie.
+        key = (len(shape[5]), shape[1], shape[2], shape[3], -(abs(x - center) + abs(y - center)))
+        if best_key is None or key > best_key:
+            best = cell
+            best_key = key
+    if best is None:
+        return None
+    return best % size, best // size
 
 
 def _fives_at(board: list[int], size: int, near: list[int], player: int) -> list[int]:
@@ -354,25 +576,6 @@ def _has_neighbor(board: list[int], size: int, x: int, y: int) -> bool:
     _lines, _through, neigh = _geometry(size)
     index = y * size + x
     return any(board[other] for other in neigh[index])
-
-
-def _has_five_pattern(board: list[int], size: int, player: int) -> bool:
-    """True when player already has one of the 5-cell patterns on a line."""
-    lines, _through, _neigh = _geometry(size)
-    for cells in lines:
-        text = "".join(str(board[index]) for index in cells)
-        if player == WHITE:
-            text = text.translate(_SWAP)
-        if len(text) < 5:
-            continue
-        if len(text) == 5:
-            if text in _FIVE:
-                return True
-            continue
-        for start in range(len(text) - 4):
-            if text[start : start + 5] in _FIVE:
-                return True
-    return False
 
 
 class _Timeout(Exception):
@@ -405,7 +608,7 @@ class _Board:
         self.history: list[int] = []
 
     def value(self, player: int) -> int:
-        """Pattern points of player minus pattern points of the other side."""
+        """Our threats minus theirs, from the shapes on every line."""
         if player == BLACK:
             return self.sum_black - self.sum_white
         return self.sum_white - self.sum_black
@@ -439,17 +642,36 @@ class _Board:
             self.near[other] -= 1
 
     def candidates(self, player: int) -> list[int]:
-        """Empty cells within two steps of a stone, best move first."""
-        found = [
-            index
-            for index, value in enumerate(self.board)
-            if not value and self.near[index]
-        ]
-        found.sort(
-            key=lambda index: (_move_value(self.board, self.size, index, player), self._closeness(index)),
-            reverse=True,
-        )
-        return found
+        """Empty cells within two steps of a stone, strongest threat first."""
+        return [index for _tier, _score, index in self._ranked(player)]
+
+    def _ranked(self, player: int) -> list[tuple[int, int, int]]:
+        rows = []
+        center = self.size // 2
+        for index, value in enumerate(self.board):
+            if value or not self.near[index]:
+                continue
+            tier, score = _classify(self.board, self.size, index, player)
+            x = index % self.size
+            y = index // self.size
+            # Touching more stones beats running away. Closer to the center
+            # beats a higher cell number, which used to march into the corner.
+            dist = abs(x - center) + abs(y - center)
+            rows.append((tier, score, self._touch(index), self._closeness(index), -dist, index))
+        rows.sort(key=lambda item: item[:5], reverse=True)
+        return [(tier, score, index) for tier, score, _touch, _close, _dist, index in rows]
+
+    def _touch(self, index: int) -> int:
+        """How many stones sit one step away, in any of the eight directions."""
+        x = index % self.size
+        y = index // self.size
+        count = 0
+        for dx, dy in _RAYS:
+            nx = x + dx
+            ny = y + dy
+            if _inside(self.size, nx, ny) and self.board[ny * self.size + nx]:
+                count += 1
+        return count
 
     def _closeness(self, index: int) -> int:
         """2 when a stone is one step away, 1 when the nearest is two steps."""
@@ -469,6 +691,37 @@ class _Board:
         return best
 
 
+def _keep_threats(rows: list[tuple[int, int, int]], depth: int) -> list[int]:
+    """Keep wins and saving blocks, then a few verified tactics, then quiet moves.
+
+    The cut applies only after those groups. It stays small on purpose: a
+    17×17 board must not grow into dozens of branches at every depth.
+    """
+    wins = []
+    blocks = []
+    tactical = []
+    useful = []
+    other = []
+    for tier, _score, index in rows:
+        if tier >= 5:
+            wins.append(index)
+        elif tier == 4:
+            blocks.append(index)
+        elif tier == 3:
+            tactical.append(index)
+        elif tier == 2:
+            useful.append(index)
+        else:
+            other.append(index)
+    if depth <= 1:
+        tactical_cap, useful_cap, other_cap = 8, 6, 4
+    elif depth == 2:
+        tactical_cap, useful_cap, other_cap = 6, 4, 3
+    else:
+        tactical_cap, useful_cap, other_cap = 5, 3, 2
+    return wins + blocks + tactical[:tactical_cap] + useful[:useful_cap] + other[:other_cap]
+
+
 def _search(
     pos: _Board,
     player: int,
@@ -476,41 +729,44 @@ def _search(
     alpha: int,
     beta: int,
     deadline: float | None,
+    live=None,
 ) -> tuple[int, int | None]:
+    if live is not None and not live():
+        raise _Timeout
     if deadline is not None and time.perf_counter() > deadline:
         raise _Timeout
     finished = winner(pos.board, pos.size)
     if finished:
-        return (10**12 if finished == player else -(10**12)), None
+        return (_MATE if finished == player else -_MATE), None
     other = opponent(player)
     near = [index for index, value in enumerate(pos.board) if not value and pos.near[index]]
     wins = _fives_at(pos.board, pos.size, near, player)
     if wins:
-        return 10**12, wins[0]
+        # A win elsewhere beats a passive block. Prefer the richer winning square.
+        if len(wins) > 1:
+            wins.sort(key=lambda index: _move_value(pos.board, pos.size, index, player), reverse=True)
+        return _MATE, wins[0]
     blocks = _fives_at(pos.board, pos.size, near, other)
+    # Two winning squares are independent: one reply cannot cover both.
     if len(blocks) >= 2:
-        return -(10**12), blocks[0]
+        blocks.sort(key=lambda index: _move_value(pos.board, pos.size, index, player), reverse=True)
+        return -_MATE, blocks[0]
     if depth <= 0:
-        if blocks:
-            return -(10**12), blocks[0]
         return pos.value(player), None
     if blocks:
+        # The only saving square. Search it so the opponent's next attack is
+        # played out; a block that merely delays then scores as a loss.
         moves = blocks
     else:
-        moves = pos.candidates(player)
+        moves = _keep_threats(pos._ranked(player), depth)
     if not moves:
         return 0, None
-    # The lines above already put blocks and builds first. Keeping the rest
-    # would spend the whole time budget inside one depth and never go deeper.
-    cap = 18 if depth <= 1 else (14 if depth == 2 else 10)
-    if len(moves) > cap:
-        moves = moves[:cap]
     best = -_INF
     best_move = moves[0]
     for index in moves:
         pos.place(index, player)
         try:
-            score, _reply = _search(pos, other, depth - 1, -beta, -alpha, deadline)
+            score, _reply = _search(pos, other, depth - 1, -beta, -alpha, deadline, live)
         finally:
             pos.undo()
         score = -score
@@ -1213,6 +1469,9 @@ class Watcher:
         self.depth = depth
         self.xs: list[int] | None = None
         self.ys: list[int] | None = None
+        self.full_xs: list[int] | None = None
+        self.full_ys: list[int] | None = None
+        self.trim = 0
         self.pending: tuple | None = None
         self.stable: tuple | None = None
         self.prev_raw: tuple | None = None
@@ -1226,6 +1485,7 @@ class Watcher:
         self.acted_at = 0.0
         self.acted_board: tuple | None = None
         self.retries = 0
+        self.opener = BLACK
         self._lock = threading.Lock()
         self._gen = 0
         self._worker_key = None
@@ -1278,7 +1538,7 @@ class Watcher:
         options = tk.Frame(self.panel)
         options.pack(side="bottom", pady=(0, 8))
         tk.Label(options, text="Bên đi:").pack(side="left", padx=(4, 0))
-        for value, label in (("auto", "Tự động"), ("black", "Đen"), ("white", "Trắng")):
+        for value, label in (("auto", "Tự động"), ("first", "Trước"), ("second", "Sau")):
             tk.Radiobutton(options, text=label, variable=self.side_var, value=value, command=self._invalidate).pack(
                 side="left"
             )
@@ -1288,6 +1548,7 @@ class Watcher:
         buttons = tk.Frame(self.panel)
         buttons.pack(side="bottom", pady=(0, 4))
         tk.Button(buttons, text="Đọc lại lưới", command=self.reset_grid).pack(side="left", padx=4)
+        tk.Button(buttons, text="Bỏ đường viền", command=self.drop_border).pack(side="left", padx=4)
         self.auto_button = tk.Button(buttons, command=self.toggle_auto, width=20)
         self.auto_button.pack(side="left", padx=4)
         tk.Button(buttons, text="Dừng", command=self.stop).pack(side="left", padx=4)
@@ -1331,6 +1592,7 @@ class Watcher:
         with self._lock:
             self._gen += 1
             self._result_key = None
+            self._worker_key = None
 
     def _redraw(self):
         self.last_marks = None
@@ -1352,6 +1614,8 @@ class Watcher:
     def reset_grid(self):
         self.xs = None
         self.ys = None
+        self.full_xs = None
+        self.full_ys = None
         self.pending = None
         self.stable = None
         self.prev_raw = None
@@ -1363,9 +1627,53 @@ class Watcher:
         self.matched_at = None
         self.acted_board = None
         self.retries = 0
+        self.opener = BLACK
         self.last_marks = None
         self._invalidate()
         self.status.set("Đang tìm lại lưới")
+
+    def _trimmed(self, xs, ys) -> tuple[list[int], list[int]] | None:
+        """Drop trim layers of outermost lines. None when fewer than 9 lines would remain."""
+        layers = self.trim
+        if len(xs) - 2 * layers < 9 or len(ys) - 2 * layers < 9:
+            return None
+        if layers <= 0:
+            return list(xs), list(ys)
+        return list(xs)[layers:-layers], list(ys)[layers:-layers]
+
+    def _lock_grid(self, xs, ys) -> None:
+        self.full_xs = list(xs)
+        self.full_ys = list(ys)
+        trimmed = self._trimmed(xs, ys)
+        self.xs, self.ys = trimmed if trimmed is not None else (list(xs), list(ys))
+        self.stable = None
+        self.prev_raw = None
+        self.matched_at = None
+        self.pending = None
+
+    def drop_border(self):
+        """Drop the outermost line on every side, once."""
+        if not self.full_xs or not self.full_ys:
+            self.status.set("Chưa có lưới. Hãy khoanh bàn trước.")
+            return
+        if self.trim >= 1:
+            self.status.set(f"Đã bỏ đường viền. Bàn đang {len(self.xs)}×{len(self.ys)}.")
+            return
+        self.trim = 1
+        trimmed = self._trimmed(self.full_xs, self.full_ys)
+        if trimmed is None:
+            self.trim = 0
+            self.status.set("Không bỏ được vì bàn còn quá ít đường.")
+            return
+        self.xs, self.ys = trimmed
+        self.alt = None
+        self.stable = None
+        self.prev_raw = None
+        self.matched_at = None
+        self.pending = None
+        self.last_marks = None
+        self._invalidate()
+        self.status.set(f"Đã bỏ đường viền. Còn {len(self.xs)}×{len(self.ys)}.")
 
     def toggle_auto(self):
         if pyautogui is None:
@@ -1422,20 +1730,15 @@ class Watcher:
         if not found:
             return
         nxs, nys = found
-        if self.xs is None:
-            self.xs, self.ys = list(nxs), list(nys)
-            self.stable = None
-            self.prev_raw = None
+        if self.full_xs is None:
+            self._lock_grid(nxs, nys)
             return
-        if _grids_close(nxs, self.xs) and _grids_close(nys, self.ys):
+        if _grids_close(nxs, self.full_xs) and _grids_close(nys, self.full_ys):
             self.alt = None
             return
         if self.alt is not None and _grids_close(nxs, self.alt[0]) and _grids_close(nys, self.alt[1]):
-            self.xs, self.ys = list(nxs), list(nys)
             self.alt = None
-            self.stable = None
-            self.prev_raw = None
-            self.pending = None
+            self._lock_grid(nxs, nys)
             return
         self.alt = (list(nxs), list(nys))
 
@@ -1451,7 +1754,7 @@ class Watcher:
             grid = find_grid(image)
             if grid is None:
                 return None
-            self.xs, self.ys = grid
+            self._lock_grid(*grid)
             self.grid_at = now
             return parse_board(image, self.xs, self.ys)
         start_grid = False
@@ -1539,9 +1842,12 @@ class Watcher:
             self.board.insert("end", picture)
         self._auto_play(move, advice, settled, shown, xs, ys, scale_x, scale_y)
 
-    def _think(self, board: list[int], size: int, player: int, depth: int, budget: float | None, key, gen: int) -> None:
+    def _think(self, board: list[int], size: int, player: int, depth: int, budget: float | None, key, gen: int, deep: bool) -> None:
+        def live() -> bool:
+            return self._gen == gen
+
         try:
-            move = choose_move(board, size, player, depth, budget, complete=True)
+            move = choose_move(board, size, player, depth, budget, complete=deep, live=live)
         except Exception:
             move = None
         with self._lock:
@@ -1557,49 +1863,52 @@ class Watcher:
             return None, "Đen đã có năm quân."
         if done == WHITE:
             return None, "Trắng đã có năm quân."
-        if not settled:
-            black = sum(value == BLACK for value in board)
-            white = sum(value == WHITE for value in board)
-            return None, f"Đen {black}, trắng {white}. Đang quét hết bàn…"
-        turn = side_to_move(board)
-        choice = self.side_var.get()
-        black = sum(value == BLACK for value in board)
-        white = sum(value == WHITE for value in board)
+        turn, opener, black, white = whose_turn(board, self.opener)
         counts = f"Đen {black}, trắng {white}."
-        if turn is None and choice == "auto":
-            return None, f"{counts} Số quân lệch, hãy chọn bên Đen hoặc Trắng."
-        if choice == "auto":
+        if not settled:
+            return None, f"{counts} Đang quét hết bàn…"
+        if turn is None:
+            return None, f"{counts} Số quân lệch, đọc lại bàn."
+        self.opener = opener
+        choice = self.side_var.get()
+        if choice == "first":
+            player = opener
+        elif choice == "second":
+            player = opponent(opener)
+        else:
             player = turn
+        if turn != player:
+            return None, f"{counts} Đến lượt {_seat(turn, opener)}."
+        # Both seats use the same search. "Nghĩ kỹ hơn" keeps looking after the
+        # first stable depth, but still stops on the clock so the button returns.
+        deep = self.deep.get()
+        if deep:
+            depth, budget = min(max(self.depth, 4) + 2, 8), 3.0
         else:
-            player = BLACK if choice == "black" else WHITE
-            if turn is not None and turn != player:
-                name = "đen" if turn == BLACK else "trắng"
-                return None, f"{counts} Đến lượt {name}."
-            if not any(board) and player == WHITE:
-                return None, "Bàn trống. Đen đi trước."
-        # Run the search all the way through. Depth 4 is the deepest pass that
-        # still finishes; "Nghĩ kỹ hơn" adds one more pass.
-        if self.deep.get():
-            depth, budget = min(self.depth + 1, 5), None
-        else:
-            depth, budget = min(self.depth, 4), None
-        key = (tuple(board), player, depth, budget)
+            depth, budget = min(self.depth, 4), 1.2
+        key = (tuple(board), player, depth, budget, deep)
         with self._lock:
             if self._result_key == key:
                 move = self._result_move
+                ready = True
             else:
                 move = None
-                if self._worker_key is None:
+                ready = False
+                if self._worker_key != key:
                     self._worker_key = key
+                    gen = self._gen
                     threading.Thread(
                         target=self._think,
-                        args=(list(board), size, player, depth, budget, key, self._gen),
+                        args=(list(board), size, player, depth, budget, key, gen, deep),
                         daemon=True,
                     ).start()
+        seat = _seat(player, opener)
+        if not ready:
+            verb = "Đang nghĩ kỹ" if deep else "Đang tính nước"
+            return None, f"{counts} {verb} cho bên {seat}…"
         if move is None:
-            return None, f"{counts} Đang tính nước tốt nhất…"
-        name = "Đen" if player == BLACK else "Trắng"
-        return move, f"{counts} Lượt {name}. Gợi ý hàng {move[1] + 1}, cột {move[0] + 1}."
+            return None, f"{counts} Không có nước cho bên {seat}."
+        return move, f"{counts} Lượt {seat}. Gợi ý hàng {move[1] + 1}, cột {move[0] + 1}."
 
     def _draw_marks(self, board, move, xs, ys, scale_x, scale_y, shift_x, shift_y):
         self.canvas.delete("all")
@@ -1705,7 +2014,12 @@ class Watcher:
 
 def main():
     parser = argparse.ArgumentParser(description="Đọc bàn cờ caro trên màn hình và gợi ý nước đi")
-    parser.add_argument("--side", choices=("auto", "black", "white"), default="auto", help="Bên do tool điều khiển")
+    parser.add_argument(
+        "--side",
+        choices=("auto", "first", "second"),
+        default="auto",
+        help="Bên do tool điều khiển: tự động, người đi trước, hoặc người đi sau",
+    )
     parser.add_argument("--depth", type=int, default=6, help="Độ sâu tìm nước tối đa, từ 1 đến 8")
     args = parser.parse_args()
     print("Mở bàn cờ caro, rồi kéo một khung chứa cả bàn. Thừa viền cũng được.")
