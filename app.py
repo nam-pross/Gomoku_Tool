@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import threading
 import time
 import tkinter as tk
 from functools import lru_cache
+from pathlib import Path
 
 from PIL import ImageGrab
 
@@ -66,7 +68,7 @@ def whose_turn(board: list[int], remembered: int = BLACK) -> tuple[int | None, i
             white += 1
     opener = remembered if remembered in (BLACK, WHITE) else BLACK
     if black == 0 and white == 0:
-        return BLACK, BLACK, 0, 0
+        return opener, opener, 0, 0
     gap = black - white
     if gap == 0:
         return opener, opener, black, white
@@ -75,6 +77,37 @@ def whose_turn(board: list[int], remembered: int = BLACK) -> tuple[int | None, i
     if gap == -1:
         return BLACK, WHITE, black, white
     return None, opener, black, white
+
+
+_TURN_PATH = Path(__file__).with_name("turn.json")
+_TURN_MAX_AGE = 6.0
+
+
+def read_live_turn():
+    """Latest word from inspect_papergames.py: is it our move, and which stone."""
+    try:
+        data = json.loads(_TURN_PATH.read_text(encoding="utf-8"))
+        age = time.time() - float(data.get("at") or 0)
+    except (OSError, ValueError, TypeError):
+        return None
+    if age < 0 or age > _TURN_MAX_AGE:
+        return None
+    symbol = data.get("symbol") or ""
+    if symbol not in ("dark", "light"):
+        symbol = ""
+    return {
+        "your_turn": bool(data.get("your_turn")),
+        "symbol": symbol,
+        "room": str(data.get("room") or ""),
+    }
+
+
+def _symbol_player(symbol: str):
+    if symbol == "dark":
+        return BLACK
+    if symbol == "light":
+        return WHITE
+    return None
 
 
 def _seat(player: int, opener: int) -> str:
@@ -242,6 +275,7 @@ def choose_move(
     deadline = None if not time_limit else time.perf_counter() + time_limit
     depth = max(1, min(8, depth))
     best = None
+    best_score = 0
     prev = None
     for level in range(1, depth + 1):
         if live is not None and not live():
@@ -259,6 +293,7 @@ def choose_move(
         if move is None:
             break
         best = move
+        best_score = score
         # A proven five, or two winning squares, ends the search. A short
         # search may also stop once two deeper passes agree.
         if abs(score) >= _MATE - 2 or (not complete and move == prev and level >= 3):
@@ -275,6 +310,10 @@ def choose_move(
         else:
             center = size // 2
             best = min(points, key=lambda index: abs(index % size - center) + abs(index // size - center))
+    elif abs(best_score) < _MATE - 2:
+        # A finished search can still hand them a free three when the clock
+        # stops on a shallow pass. Take a square that does not do that.
+        best = _refuse_gift(board, size, player, best)
     x, y = best % size, best // size
     return _guard_move(board, size, player, (x, y))
 
@@ -330,7 +369,7 @@ def _long_open_threes(seg: str) -> int:
 
 def _segment_score(seg: str) -> int:
     """Score one stretch with no opponent stones in it."""
-    if len(seg) < 5 or "1" not in seg:
+    if len(seg) < 4 or "1" not in seg:
         return 0
     used = [False] * len(seg)
     score = 0
@@ -360,11 +399,25 @@ def _segment_score(seg: str) -> int:
     take("010110", 2_000)
     take("001110", 700)
     take("011100", 700)
+    # Pairs and closed threes stay on the board after a one-way four is blocked.
+    # They are worth noticing, and still far below a live three or a four.
+    take("001100", 120)
+    take("010100", 80)
+    take("001010", 80)
+    take("1110", 400)
+    take("0111", 400)
+    take("1101", 200)
+    take("1011", 200)
+    take("0110", 40)
     return score
 
 
+@lru_cache(maxsize=16384)
 def _line_scores(text: str) -> tuple[int, int, int, int]:
-    """Black score, white score, and each side's long open threes on one line."""
+    """Black score, white score, and each side's long open threes on one line.
+
+    The same line text comes back on every undo, so the cache skips the rescore.
+    """
     black, black_long = _window_score(text)
     white, white_long = _window_score(text.translate(_SWAP))
     return black, white, black_long, white_long
@@ -420,15 +473,22 @@ def _makes_five(board: list[int], size: int, x: int, y: int, player: int) -> boo
     """True when playing here completes five or more in a row."""
     for dx, dy in _AXES:
         count = 1
-        for sign in (1, -1):
-            nx = x + sign * dx
-            ny = y + sign * dy
-            for _step in range(4):
-                if not _inside(size, nx, ny) or board[ny * size + nx] != player:
-                    break
-                count += 1
-                nx += sign * dx
-                ny += sign * dy
+        nx = x + dx
+        ny = y + dy
+        for _step in range(4):
+            if nx < 0 or ny < 0 or nx >= size or ny >= size or board[ny * size + nx] != player:
+                break
+            count += 1
+            nx += dx
+            ny += dy
+        nx = x - dx
+        ny = y - dy
+        for _step in range(4):
+            if nx < 0 or ny < 0 or nx >= size or ny >= size or board[ny * size + nx] != player:
+                break
+            count += 1
+            nx -= dx
+            ny -= dy
         if count >= 5:
             return True
     return False
@@ -466,6 +526,110 @@ def _broken_live_axis(text: str, coords: list[int]) -> tuple[list[int], list[int
     return None
 
 
+# One reused window per thread. Shape reads do not call each other.
+_scan = threading.local()
+
+
+def _bufs():
+    vals = getattr(_scan, "vals", None)
+    if vals is None:
+        vals = [2] * 9
+        coords = [-1] * 9
+        _scan.vals = vals
+        _scan.coords = coords
+        return vals, coords
+    return vals, _scan.coords
+
+
+def _load_axis(board, size, x, y, dx, dy, player, vals, coords):
+    """Nine cells centered on the move: 0 empty, 1 our stone, 2 wall."""
+    for index in range(9):
+        vals[index] = 2
+        coords[index] = -1
+    vals[4] = 1
+    coords[4] = y * size + x
+    friendly = 1
+    nx = x
+    ny = y
+    for step in range(1, 5):
+        nx += dx
+        ny += dy
+        if nx < 0 or ny < 0 or nx >= size or ny >= size:
+            break
+        slot = 4 + step
+        cell = ny * size + nx
+        coords[slot] = cell
+        stone = board[cell]
+        if stone == EMPTY:
+            vals[slot] = 0
+        elif stone == player:
+            vals[slot] = 1
+            friendly += 1
+    nx = x
+    ny = y
+    for step in range(1, 5):
+        nx -= dx
+        ny -= dy
+        if nx < 0 or ny < 0 or nx >= size or ny >= size:
+            break
+        slot = 4 - step
+        cell = ny * size + nx
+        coords[slot] = cell
+        stone = board[cell]
+        if stone == EMPTY:
+            vals[slot] = 0
+        elif stone == player:
+            vals[slot] = 1
+            friendly += 1
+    return friendly
+
+
+def _axis_wins(vals, coords):
+    """A finished five, and the empty squares inside any four-plus-one window."""
+    found = []
+    for start in range(5):
+        ones = 0
+        zero_at = -1
+        for offset in range(5):
+            value = vals[start + offset]
+            if value == 1:
+                ones += 1
+            elif value == 0:
+                zero_at = start + offset
+        if ones == 5:
+            return True, found
+        if ones == 4 and zero_at >= 0:
+            point = coords[zero_at]
+            if point >= 0 and point not in found:
+                found.append(point)
+    return False, found
+
+
+def _broken_vals(vals) -> bool:
+    """XX.X or X.XX with both wings empty, and the center cell one of the three."""
+    return (
+        (vals[0] == 0 and vals[1] == 1 and vals[2] == 1 and vals[3] == 0 and vals[4] == 1 and vals[5] == 0)
+        or (vals[2] == 0 and vals[3] == 1 and vals[4] == 1 and vals[5] == 0 and vals[6] == 1 and vals[7] == 0)
+        or (vals[3] == 0 and vals[4] == 1 and vals[5] == 1 and vals[6] == 0 and vals[7] == 1 and vals[8] == 0)
+        or (vals[0] == 0 and vals[1] == 1 and vals[2] == 0 and vals[3] == 1 and vals[4] == 1 and vals[5] == 0)
+        or (vals[1] == 0 and vals[2] == 1 and vals[3] == 0 and vals[4] == 1 and vals[5] == 1 and vals[6] == 0)
+        or (vals[3] == 0 and vals[4] == 1 and vals[5] == 0 and vals[6] == 1 and vals[7] == 1 and vals[8] == 0)
+    )
+
+
+def _run_bounds(vals):
+    left = 4
+    while left > 0 and vals[left - 1] == 1:
+        left -= 1
+    right = 4
+    while right < 8 and vals[right + 1] == 1:
+        right += 1
+    length = right - left + 1
+    left_open = left > 0 and vals[left - 1] == 0
+    right_open = right < 8 and vals[right + 1] == 0
+    return left, right, length, left_open, right_open
+
+
 def _analyze_move(board: list[int], size: int, x: int, y: int, player: int):
     """Shapes made by playing at this empty cell.
 
@@ -475,50 +639,11 @@ def _analyze_move(board: list[int], size: int, x: int, y: int, player: int):
     fives = open4 = closed4 = open3 = half3 = open2 = 0
     wins = []
     ends = []
+    vals, coords = _bufs()
     for dx, dy in _AXES:
-        chars = []
-        coords = []
-        for step in range(-4, 5):
-            nx = x + dx * step
-            ny = y + dy * step
-            if step == 0:
-                chars.append("1")
-                coords.append(y * size + x)
-                continue
-            if not _inside(size, nx, ny):
-                chars.append("2")
-                coords.append(-1)
-                continue
-            value = board[ny * size + nx]
-            if value == EMPTY:
-                chars.append("0")
-            elif value == player:
-                chars.append("1")
-            else:
-                chars.append("2")
-            coords.append(ny * size + nx)
-        text = "".join(chars)
-        center = 4
-        dir_wins = []
-        five = False
-        for start in range(5):
-            window = text[start : start + 5]
-            if window == "11111":
-                five = True
-                break
-            if window.count("1") == 4 and window.count("0") == 1:
-                point = coords[start + window.index("0")]
-                if point >= 0 and point not in dir_wins:
-                    dir_wins.append(point)
-        left = center
-        while left > 0 and text[left - 1] == "1":
-            left -= 1
-        right = center
-        while right + 1 < 9 and text[right + 1] == "1":
-            right += 1
-        length = right - left + 1
-        left_open = left > 0 and text[left - 1] == "0"
-        right_open = right + 1 < 9 and text[right + 1] == "0"
+        _load_axis(board, size, x, y, dx, dy, player, vals, coords)
+        five, dir_wins = _axis_wins(vals, coords)
+        left, right, length, left_open, right_open = _run_bounds(vals)
         if five or length >= 5:
             fives += 1
             continue
@@ -540,7 +665,7 @@ def _analyze_move(board: list[int], size: int, x: int, y: int, player: int):
                 point = coords[slot]
                 if point >= 0 and point not in ends:
                     ends.append(point)
-        elif _broken_live_axis(text, coords) is not None:
+        elif _broken_vals(vals):
             # XX.X or X.XX, both wings empty. One move in the gap makes an open four.
             open3 += 1
         elif length == 3 and (left_open or right_open):
@@ -548,6 +673,30 @@ def _analyze_move(board: list[int], size: int, x: int, y: int, player: int):
         elif length == 2 and left_open and right_open:
             open2 += 1
     return fives, open4, closed4, open3, half3, wins, ends, open2
+
+
+def _has_two_wins(board, size, x, y, player) -> bool:
+    """True when this move makes two different squares that finish a five."""
+    wins = []
+    vals, coords = _bufs()
+    for dx, dy in _AXES:
+        # A four needs three stones already on this line, plus the move.
+        if _load_axis(board, size, x, y, dx, dy, player, vals, coords) < 4:
+            continue
+        five, dir_wins = _axis_wins(vals, coords)
+        if five:
+            continue
+        _left, _right, length, left_open, right_open = _run_bounds(vals)
+        if length >= 5:
+            continue
+        if not ((length == 4 and left_open and right_open) or dir_wins):
+            continue
+        for point in dir_wins:
+            if point not in wins:
+                wins.append(point)
+                if len(wins) >= 2:
+                    return True
+    return False
 
 
 def _forcing(shape) -> bool:
@@ -827,8 +976,7 @@ def _urgent_cells(board: list[int], size: int, player: int) -> list[int]:
     """Empty cells that make two winning squares. One reply cannot cover both."""
     found = []
     for cell in _nearby(board, size):
-        shape = _analyze_move(board, size, cell % size, cell // size, player)
-        if len(shape[5]) >= 2:
+        if _has_two_wins(board, size, cell % size, cell // size, player):
             found.append(cell)
     return found
 
@@ -848,10 +996,21 @@ def _urgent_answers(board: list[int], size: int, player: int) -> tuple[list[int]
     for cell in urgent:
         board[cell] = player
         try:
-            left = len(_urgent_cells(board, size, other))
+            # Our stone only removes their threats, and only on its own lines.
+            # Any threat it does not touch is still there.
+            left = False
+            for other_cell in urgent:
+                if other_cell == cell:
+                    continue
+                if _affects(size, cell, other_cell) and not _has_two_wins(
+                    board, size, other_cell % size, other_cell // size, other
+                ):
+                    continue
+                left = True
+                break
         finally:
             board[cell] = EMPTY
-        if left == 0:
+        if not left:
             saves.append(cell)
         else:
             partial.append(cell)
@@ -872,11 +1031,47 @@ def _prefer_attack(board: list[int], size: int, player: int, cells: list[int]) -
     return max(cells, key=lambda cell: _attack_key(board, size, player, cell))
 
 
+def _opponent_can_force(board: list[int], size: int, player: int) -> bool:
+    """True when the side to move can win at once, or still win after the block.
+
+    A plain open three is not enough: the defender gets another turn. A five,
+    an open four, a four that leaves a second threat, or a winning double
+    three is enough.
+    """
+    for cell in _nearby(board, size):
+        x, y = cell % size, cell // size
+        if _makes_five(board, size, x, y, player):
+            return True
+        shape = _analyze_move(board, size, x, y, player)
+        if shape[0] or shape[1] or len(shape[5]) >= 2:
+            return True
+        if shape[3] >= 2 and _three_three_wins(board, size, x, y, player):
+            return True
+        if (_forcing(shape) or shape[2]) and _reply_holds(board, size, cell, player):
+            return True
+    return False
+
+
+def _safe_cells(board: list[int], size: int, player: int, cells: list[int]) -> list[int]:
+    """Blocks that do not hand the opponent a forced win on the next move."""
+    other = opponent(player)
+    safe = []
+    for cell in cells:
+        board[cell] = player
+        try:
+            fatal = _opponent_can_force(board, size, other)
+        finally:
+            board[cell] = EMPTY
+        if not fatal:
+            safe.append(cell)
+    return safe
+
+
 def _win_squares(board: list[int], size: int, player: int) -> list[int]:
     """Empty cells where player would complete five."""
     found = []
     for cell in _nearby(board, size):
-        if _analyze_move(board, size, cell % size, cell // size, player)[0]:
+        if _makes_five(board, size, cell % size, cell // size, player):
             found.append(cell)
     return found
 
@@ -1002,6 +1197,18 @@ def _best_verified_fork(
     return cell % size, cell // size
 
 
+def _worth_forks(board, size, player, cells, ranks):
+    """A single open three joins a fork only when another three is already there."""
+    if not cells:
+        return cells
+    doubles = [cell for cell in cells if ranks[cell] >= 2]
+    if len(doubles) == len(cells):
+        return cells
+    if _all_live_threes(board, size, player):
+        return cells
+    return doubles
+
+
 def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int] | None:
     """The winning move, the only saving block, or the richest forced threat.
 
@@ -1014,6 +1221,8 @@ def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int]
     attacks = []
     forks = []
     denies = []
+    fork_rank = {}
+    deny_rank = {}
     other = opponent(player)
     for cell in _nearby(board, size):
         x, y = cell % size, cell // size
@@ -1027,8 +1236,10 @@ def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int]
             continue
         if mine[3] >= 1:
             forks.append(cell)
+            fork_rank[cell] = mine[3]
         if their_shape[3] >= 1:
             denies.append(cell)
+            deny_rank[cell] = their_shape[3]
         if mine[1] or len(mine[5]) >= 2 or _forcing(mine):
             attacks.append((cell, mine))
     if fives:
@@ -1049,13 +1260,6 @@ def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int]
     if our_urgent:
         cell = _prefer_attack(board, size, player, our_urgent)
         return cell % size, cell // size
-    saves, partial = _urgent_answers(board, size, player)
-    if saves:
-        cell = _prefer_attack(board, size, player, saves)
-        return cell % size, cell // size
-    if partial:
-        cell = _prefer_attack(board, size, player, partial)
-        return cell % size, cell // size
     best = None
     best_key = None
     for cell, shape in attacks:
@@ -1071,11 +1275,29 @@ def _best_immediate(board: list[int], size: int, player: int) -> tuple[int, int]
     if best is not None:
         return best % size, best // size
     # Two open threes win if each one can still become an open four.
-    fork = _best_verified_fork(board, size, forks, player)
+    fork = _best_verified_fork(board, size, _worth_forks(board, size, player, forks, fork_rank), player)
     if fork is not None:
         return fork
+    # Their open four has to be stopped on a square that does not start a new
+    # forced win. The nearer center is not that test: one end of a three can
+    # be the junction of a four-three, and blocking the other end loses.
+    saves, partial = _urgent_answers(board, size, player)
+    for group in (saves, partial):
+        safe = _safe_cells(board, size, player, group)
+        if safe:
+            cell = _prefer_attack(board, size, player, safe)
+            return cell % size, cell // size
     # Their double three is the same win, one move later. Take the junction.
-    return _best_verified_fork(board, size, denies, other)
+    fork = _best_verified_fork(board, size, _worth_forks(board, size, other, denies, deny_rank), other)
+    if fork is not None:
+        return fork
+    if saves:
+        cell = _prefer_attack(board, size, player, saves)
+        return cell % size, cell // size
+    if partial:
+        cell = _prefer_attack(board, size, player, partial)
+        return cell % size, cell // size
+    return None
 
 
 def _fives_at(board: list[int], size: int, near: list[int], player: int) -> list[int]:
@@ -1124,6 +1346,117 @@ def _beside_lone_stone(board: list[int], size: int, player: int, x: int, y: int)
                 best = (nx, ny)
     if best is None:
         return x, y
+    return best
+
+
+def _threat_key(shape) -> tuple[int, int, int]:
+    """Five, then open four or two winning squares, then an open three."""
+    return (
+        1 if shape[0] else 0,
+        1 if shape[1] or len(shape[5]) >= 2 else 0,
+        1 if shape[3] else 0,
+    )
+
+
+def _affects(size: int, origin: int, cell: int) -> bool:
+    """True when cell lies within four steps of origin on a row, column, or diagonal."""
+    oy, ox = divmod(origin, size)
+    cy, cx = divmod(cell, size)
+    dx = cx - ox
+    dy = cy - oy
+    ax = dx if dx >= 0 else -dx
+    ay = dy if dy >= 0 else -dy
+    if ax == 0:
+        return 0 < ay <= 4
+    if ay == 0:
+        return 0 < ax <= 4
+    return ax == ay and ax <= 4
+
+
+def _shot_from_keys(board, size, move, player, keys, other, base) -> tuple[int, int, int]:
+    """Opponent's immediate shot after we play at move.
+
+    keys are (cell, threat) in nearby order, read before the stone was placed.
+    base is that shot on the untouched board. Our stone never creates one of
+    their threats. It can only remove a threat on its own row, column or
+    diagonal, inside the four-cell window. A quiet square keeps base.
+    """
+    if _makes_five(board, size, move % size, move // size, player):
+        return (0, 0, 0)
+    for cell, key in keys:
+        if key == (0, 0, 0):
+            continue
+        if cell == move or _affects(size, move, cell):
+            break
+    else:
+        return base
+    best = (0, 0, 0)
+    board[move] = player
+    try:
+        for cell, key in keys:
+            if cell == move:
+                continue
+            if key != (0, 0, 0) and _affects(size, move, cell):
+                key = _threat_key(_analyze_move(board, size, cell % size, cell // size, other))
+            if key > best:
+                best = key
+                if key[0]:
+                    break
+        return best
+    finally:
+        board[move] = EMPTY
+
+
+def _keeps_tempo(board: list[int], size: int, cell: int, player: int) -> bool:
+    """True when the opponent has to answer this move or lose."""
+    x = cell % size
+    y = cell // size
+    shape = _analyze_move(board, size, x, y, player)
+    if shape[0] or shape[1] or len(shape[5]) >= 2:
+        return True
+    if shape[3] >= 2 and _three_three_wins(board, size, x, y, player):
+        return True
+    if shape[5] and _reply_holds(board, size, cell, player):
+        return True
+    return False
+
+
+def _refuse_gift(board: list[int], size: int, player: int, chosen: int) -> int:
+    """Drop a move that lets them make a three or a four when a calmer square exists.
+
+    A five, an open four, or a threat that still wins after their reply stays.
+    Anything quieter is replaced when another nearby square leaves them with
+    less to play.
+    """
+    if _keeps_tempo(board, size, chosen, player):
+        return chosen
+    other = opponent(player)
+    keys = [
+        (cell, _threat_key(_analyze_move(board, size, cell % size, cell // size, other)))
+        for cell in _nearby(board, size)
+    ]
+    base = (0, 0, 0)
+    for _cell, key in keys:
+        if key > base:
+            base = key
+            if key[0]:
+                break
+    current = _shot_from_keys(board, size, chosen, player, keys, other, base)
+    if current == (0, 0, 0):
+        return chosen
+    best = chosen
+    best_key = current
+    best_attack = _attack_key(board, size, player, chosen)
+    for cell, _old in keys:
+        if cell == chosen:
+            continue
+        key = _shot_from_keys(board, size, cell, player, keys, other, base)
+        if key < best_key or (key == best_key and key < current):
+            attack = _attack_key(board, size, player, cell)
+            if key < best_key or attack > best_attack:
+                best = cell
+                best_key = key
+                best_attack = attack
     return best
 
 
@@ -1341,7 +1674,12 @@ def _search(
         raise _Timeout
     if deadline is not None and time.perf_counter() > deadline:
         raise _Timeout
-    finished = winner(pos.board, pos.size)
+    if pos.history:
+        last = pos.history[-1]
+        stone = pos.board[last]
+        finished = stone if stone and _makes_five(pos.board, pos.size, last % pos.size, last // pos.size, stone) else 0
+    else:
+        finished = winner(pos.board, pos.size)
     if finished:
         return (_MATE if finished == player else -_MATE), None
     other = opponent(player)
@@ -1362,19 +1700,51 @@ def _search(
         # Two winning squares. The opponent can stop only one, then we take five.
         return _MATE - 2, _prefer_attack(pos.board, pos.size, player, our_urgent)
     saves, partial = ([], []) if blocks else _urgent_answers(pos.board, pos.size, player)
-    if partial and not saves:
-        # No square stops every open four. The game is lost; take the richest try.
-        return -(_MATE - 2), _prefer_attack(pos.board, pos.size, player, partial)
     if depth <= 0:
+        # A single four is not an asset: the reply takes its only winning
+        # square. Score the board after that block, or a shallow pass treats
+        # the four as fifty thousand points and plays it for nothing.
+        if len(blocks) == 1 and not saves:
+            pos.place(blocks[0], player)
+            try:
+                score = pos.value(player)
+            finally:
+                pos.undo()
+            return score, None
         return pos.value(player), None
     if blocks or saves:
-        # Search the saving squares, richest attack first.
-        moves = blocks or sorted(saves, key=lambda cell: _attack_key(pos.board, pos.size, player, cell), reverse=True)
+        # Search the saving squares, richest attack first. A block that hands
+        # them a four-three is kept behind a block that actually holds.
+        if blocks:
+            moves = blocks
+        else:
+            safe = _safe_cells(pos.board, pos.size, player, saves)
+            ordered = safe or saves
+            moves = sorted(
+                ordered,
+                key=lambda cell: _attack_key(pos.board, pos.size, player, cell),
+                reverse=True,
+            )
+    elif partial and not saves:
+        safe = _safe_cells(pos.board, pos.size, player, partial)
+        if not safe and depth > 0:
+            # No block stops every open four, and none of the tries is safe.
+            # A forcing move of our own is searched below; otherwise this is lost.
+            moves = _keep_threats(pos._ranked(player), depth, root)
+            if not moves:
+                return -(_MATE - 2), _prefer_attack(pos.board, pos.size, player, partial)
+        else:
+            moves = sorted(
+                safe or partial,
+                key=lambda cell: _attack_key(pos.board, pos.size, player, cell),
+                reverse=True,
+            )
     else:
         moves = _keep_threats(pos._ranked(player), depth, root)
     if not moves:
         return 0, None
     best = -_INF
+    best_rank = -1
     best_move = moves[0]
     for index in moves:
         pos.place(index, player)
@@ -1383,8 +1753,11 @@ def _search(
         finally:
             pos.undo()
         score = -score
-        if score > best:
+        # Equal scores used to keep whichever square was scanned first.
+        rank = _move_value(pos.board, pos.size, index, player) if root else 0
+        if score > best or (score == best and rank > best_rank):
             best = score
+            best_rank = rank
             best_move = index
         if score > alpha:
             alpha = score
@@ -2142,6 +2515,7 @@ class Watcher:
         self.misses = 0
         self.guess_misses = 0
         self.opener = BLACK
+        self.page_room = None
         self.seat = _Seat()
         self.playing = None
         self.move_ready_at = 0.0
@@ -2246,7 +2620,7 @@ class Watcher:
 
     def _show_auto_state(self):
         if self.auto:
-            self.auto_text.set("TỰ ĐỘNG: BẬT · đang xem mình đi trước hay sau")
+            self.auto_text.set("TỰ ĐỘNG: BẬT · chờ trình duyệt báo lượt")
             self.auto_button.configure(text="Tắt tự động (F2)")
         else:
             self.auto_text.set("TỰ ĐỘNG: TẮT  (bấm F2 để bật)")
@@ -2579,13 +2953,47 @@ class Watcher:
             if self._worker_key == key:
                 self._worker_key = None
 
+    def _page_seat(self, board):
+        """Our color when the browser says it is our turn. Otherwise a wait message."""
+        page = read_live_turn()
+        if page is None:
+            self.playing = None
+            self.auto_text.set("TỰ ĐỘNG: BẬT · chờ trình duyệt báo lượt")
+            return None, "Chưa thấy lượt. Hãy chạy inspect_papergames.py."
+        room = page["room"]
+        if room != self.page_room:
+            self.page_room = room
+            self._forget_seat()
+            self.opener = BLACK
+        me = _symbol_player(page["symbol"])
+        if not any(board) and me in (BLACK, WHITE):
+            self.opener = me if page["your_turn"] else opponent(me)
+        if not page["your_turn"]:
+            self.playing = None
+            self.auto_text.set("TỰ ĐỘNG: BẬT · đang chờ đối thủ")
+            return None, "Đến lượt đối thủ."
+        if me not in (BLACK, WHITE):
+            self.playing = None
+            self.auto_text.set("TỰ ĐỘNG: BẬT · đến lượt bạn, chưa rõ màu")
+            return None, "Đến lượt bạn. Chưa rõ màu quân."
+        turn, opener, _black, _white = whose_turn(board, self.opener)
+        self.opener = opener
+        if turn != me:
+            self.playing = None
+            self.auto_text.set("TỰ ĐỘNG: BẬT · đến lượt bạn, đang chờ bàn khớp")
+            return None, "Đến lượt bạn. Đang chờ bàn khớp."
+        if self.seat.color != me:
+            self.seat.pending = None
+        self.seat.color = me
+        self.seat.confirmed = True
+        self.seat.assumed = False
+        self.auto_text.set(f"TỰ ĐỘNG: BẬT · đến lượt bạn · mình {_seat(me, opener)}")
+        return me, ""
+
     def _banner(self, player, opener) -> None:
-        if not self.auto:
+        if not self.auto or player is None:
             return
-        if player is None:
-            self.auto_text.set("TỰ ĐỘNG: BẬT · đang xem mình đi trước hay sau")
-            return
-        self.auto_text.set(f"TỰ ĐỘNG: BẬT · mình {_seat(player, opener)}")
+        self.auto_text.set(f"TỰ ĐỘNG: BẬT · đến lượt bạn · mình {_seat(player, opener)}")
 
     def _advise(self, board: list[int], size: int, settled: bool) -> tuple[tuple[int, int] | None, str]:
         done = winner(board, size)
@@ -2612,7 +3020,10 @@ class Watcher:
             player = opponent(opener)
             phrase = ""
         elif self.auto:
-            player, phrase = resolve_seat(self.seat, board, turn, opener, True, time.perf_counter())
+            player, phrase = self._page_seat(board)
+            opener = self.opener
+            if player is not None:
+                turn = player
         else:
             player, phrase = turn, ""
         self.playing = player
@@ -2830,6 +3241,10 @@ class Watcher:
             self.retries = 0
         if self._f2_pressed():
             return
+        if self.side_var.get() == "auto":
+            live = read_live_turn()
+            if live is None or not live["your_turn"]:
+                return
         turn, _opener, _black, _white = whose_turn(shown, self.opener)
         if self.playing is None or turn != self.playing:
             return
@@ -2845,6 +3260,13 @@ class Watcher:
         col, row = guarded
         if shown[row * size + col] != EMPTY:
             return
+        # The last click has not shown a stone yet. Retry that square only.
+        # A new suggestion while the stone is missing used to click all over
+        # the board.
+        pending = self.seat.pending
+        if pending is not None and pending < len(shown) and shown[pending] == EMPTY:
+            if (pending % size, pending // size) != (col, row):
+                return
         origin_x, origin_y, width, height = self.region
         sx = round(origin_x + xs[col] * scale_x)
         sy = round(origin_y + ys[row] * scale_y)
@@ -2877,7 +3299,7 @@ def main():
     args = parser.parse_args()
     print("Mở bàn cờ caro, rồi kéo một khung chứa cả bàn. Thừa viền cũng được.")
     print("Tool đọc quân và khoanh một nước. Phím F2 bật hoặc tắt tự click.")
-    print("Tự động chỉ đi khi đến lượt mình, và chờ trong lúc đối thủ suy nghĩ.")
+    print("Tự động chỉ đánh khi inspect_papergames.py báo đến lượt bạn.")
     print("Dừng khẩn: đưa chuột vào góc trên bên trái màn hình chính.")
     region = select_region()
     if region is None:
